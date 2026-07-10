@@ -18,8 +18,6 @@ package shencore
 
 import (
 	"context"
-	"reflect"
-	"unsafe"
 
 	"github.com/tiancaiamao/shen-go/kl"
 
@@ -86,17 +84,8 @@ func (e *Engine) CallWithBudget(ctx context.Context, fn string, args ...sexpr.Va
 	return fromObj(out)
 }
 
-// setStepLimit sets the step ceiling on a ControlFlow the Engine owns.
-//
-// TODO(shen-go): the ControlFlow.stepLimit field is unexported and shen-go
-// currently offers no constructor or setter for it (only the in-package
-// step_limit_test.go exercises it). This reflect+unsafe poke is a deliberate
-// Phase 0 bridge; the clean fix is a small exported shen-go API — e.g.
-// NewControlFlow(stepLimit int64) or (*ControlFlow).SetStepLimit(int64) — after
-// which this function collapses to that call. See the final report's shen-go
-// asks. The target ControlFlow is always one this package allocated (never
-// shared), so the write is safe.
+// setStepLimit sets the step ceiling on a ControlFlow the Engine owns, using
+// shen-go's exported budget API.
 func setStepLimit(cf *kl.ControlFlow, limit int64) {
-	field := reflect.ValueOf(cf).Elem().FieldByName("stepLimit")
-	reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem().SetInt(limit)
+	cf.SetStepLimit(limit)
 }
