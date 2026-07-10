@@ -93,6 +93,7 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 		// the Node was deleted out from under us and a Duplicate Node is an invalid state
 		if nodeclaimutils.IgnoreDuplicateNodeError(nodeclaimutils.IgnoreNodeNotFoundError(err)) != nil {
 			errs[i] = err
+			return
 		}
 		// We do a check on the Ready condition of the node since, even though the CloudProvider says the instance
 		// is not around, we know that the kubelet process is still running if the Node Ready condition is true
