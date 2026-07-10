@@ -18,6 +18,7 @@ package garbagecollection_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -43,6 +44,17 @@ import (
 	"sigs.k8s.io/karpenter/pkg/test/v1alpha1"
 	. "sigs.k8s.io/karpenter/pkg/utils/testing"
 )
+
+type failingClient struct {
+	client.Client
+}
+
+func (f *failingClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if _, ok := list.(*corev1.NodeList); ok {
+		return fmt.Errorf("simulated error listing nodes")
+	}
+	return f.Client.List(ctx, list, opts...)
+}
 
 var (
 	ctx                         context.Context
@@ -174,6 +186,32 @@ var _ = Describe("GarbageCollection", func() {
 			ExpectFinalizersRemoved(ctx, env.Client, nodeClaims[i])
 		})
 		ExpectNotFound(ctx, env.Client, lo.Map(nodeClaims, func(n *v1.NodeClaim, _ int) client.Object { return n })...)
+	})
+	It("shouldn't delete the NodeClaim when the Node lookup fails and the instance is gone", func() {
+		nodeClaim := test.NodeClaim(v1.NodeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{
+					v1.NodePoolLabelKey: nodePool.Name,
+				},
+			},
+		})
+		ExpectApplied(ctx, env.Client, nodePool, nodeClaim)
+
+		nodeClaim, _, err := ExpectNodeClaimDeployed(ctx, env.Client, cloudProvider, nodeClaim)
+		Expect(err).ToNot(HaveOccurred())
+
+		// Step forward to move past the cache eventual consistency timeout
+		env.Clock.SetTime(time.Now().Add(time.Second * 20))
+
+		// Delete the nodeClaim from the cloudprovider
+		Expect(cloudProvider.Delete(ctx, nodeClaim)).To(Succeed())
+
+		// Expect the NodeClaim to not be removed since we can't check the Node Ready condition
+		// to know whether the kubelet process is still running when the Node lookup fails
+		failingGarbageCollectionController := nodeclaimgarbagecollection.NewController(env.Clock, &failingClient{Client: env.Client}, cloudProvider)
+		ExpectSingletonReconcileFailed(ctx, failingGarbageCollectionController)
+		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+		Expect(nodeClaim.DeletionTimestamp.IsZero()).To(BeTrue())
 	})
 	It("shouldn't delete the NodeClaim when the Node isn't there and the instance is gone", func() {
 		nodeClaim := test.NodeClaim(v1.NodeClaim{

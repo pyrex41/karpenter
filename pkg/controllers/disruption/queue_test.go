@@ -17,9 +17,13 @@ limitations under the License.
 package disruption_test
 
 import (
+	"context"
+	"fmt"
 	"strconv"
+	"sync/atomic"
 	"time"
 
+	"github.com/go-logr/logr/funcr"
 	"github.com/google/uuid"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -32,7 +36,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
@@ -416,6 +422,83 @@ var _ = Describe("Queue", func() {
 			// And expect the nodeClaim and node to be deleted
 			ExpectNotFound(ctx, env.Client, nodeClaim2, node2)
 		})
+		Context("StartCommand", func() {
+			It("should log and proceed with the marked candidates when marking fails for a subset of a delete-only command", func() {
+				ExpectApplied(ctx, env.Client, nodePool, nodeClaim1, node1, nodeClaim2, node2)
+				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1, node2}, []*v1.NodeClaim{nodeClaim1, nodeClaim2})
+				stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
+				stateNode2 := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim2)
+
+				// Fail the status patch that adds the Disrupted condition to the second candidate so that
+				// only the first candidate is successfully marked
+				failingQueue := disruption.NewQueue(&failingStatusClient{Client: env.Client, failedNames: sets.New(nodeClaim2.Name)}, recorder, cluster, env.Clock, prov)
+				var logs []string
+				logCtx := log.IntoContext(ctx, funcr.New(func(_, args string) { logs = append(logs, args) }, funcr.Options{}))
+
+				cmd := &disruption.Command{
+					Method:            disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock),
+					CreationTimestamp: env.Clock.Now(),
+					ID:                uuid.New(),
+					Results:           scheduling.Results{},
+					Candidates:        []*disruption.Candidate{{StateNode: stateNode, NodePool: nodePool}, {StateNode: stateNode2, NodePool: nodePool}},
+					Replacements:      nil,
+				}
+				Expect(failingQueue.StartCommand(logCtx, cmd)).To(BeNil())
+
+				// The command should only proceed with the successfully marked candidate
+				Expect(cmd.Candidates).To(HaveLen(1))
+				Expect(cmd.Candidates[0].ProviderID()).To(Equal(stateNode.ProviderID()))
+				Expect(failingQueue.HasAny(stateNode.ProviderID())).To(BeTrue())
+				Expect(failingQueue.HasAny(stateNode2.ProviderID())).To(BeFalse())
+				// And the partial failure should be surfaced in the logs
+				Expect(logs).To(ContainElement(ContainSubstring("failed marking candidates as disrupted")))
+			})
+			It("should return an error when marking fails for all candidates of a delete-only command", func() {
+				ExpectApplied(ctx, env.Client, nodePool, nodeClaim1, node1, nodeClaim2, node2)
+				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1, node2}, []*v1.NodeClaim{nodeClaim1, nodeClaim2})
+				stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
+				stateNode2 := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim2)
+
+				// Fail the status patch that adds the Disrupted condition to both candidates so that no candidate is successfully marked
+				failingQueue := disruption.NewQueue(&failingStatusClient{Client: env.Client, failedNames: sets.New(nodeClaim1.Name, nodeClaim2.Name)}, recorder, cluster, env.Clock, prov)
+
+				cmd := &disruption.Command{
+					Method:            disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock),
+					CreationTimestamp: env.Clock.Now(),
+					ID:                uuid.New(),
+					Results:           scheduling.Results{},
+					Candidates:        []*disruption.Candidate{{StateNode: stateNode, NodePool: nodePool}, {StateNode: stateNode2, NodePool: nodePool}},
+					Replacements:      nil,
+				}
+				Expect(failingQueue.StartCommand(ctx, cmd)).ToNot(Succeed())
+				Expect(failingQueue.HasAny(stateNode.ProviderID(), stateNode2.ProviderID())).To(BeFalse())
+			})
+		})
+		Context("MarkDisrupted", func() {
+			It("should not clobber status conditions written concurrently by other controllers", func() {
+				ExpectApplied(ctx, env.Client, nodeClaim1, node1, nodePool)
+				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
+				stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
+
+				// Use a client that writes a status condition to the NodeClaim between the queue's Get and
+				// Status().Patch calls to simulate another controller updating the status conditions concurrently
+				racingClient := newConditionRacingClient(env.Client)
+				q := disruption.NewQueue(racingClient, recorder, cluster, env.Clock, prov)
+				cmd := &disruption.Command{
+					Method:            disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock),
+					CreationTimestamp: env.Clock.Now(),
+					ID:                uuid.New(),
+					Results:           scheduling.Results{},
+					Candidates:        []*disruption.Candidate{{StateNode: stateNode, NodePool: nodePool}},
+				}
+				Expect(q.StartCommand(ctx, cmd)).To(BeNil())
+
+				nodeClaim1 = ExpectExists(ctx, env.Client, nodeClaim1)
+				Expect(nodeClaim1.StatusConditions().Get(v1.ConditionTypeDisruptionReason).IsTrue()).To(BeTrue())
+				// The condition written by the other controller should not have been clobbered by the queue's patch
+				Expect(nodeClaim1.StatusConditions().Get(v1.ConditionTypeConsolidatable).IsTrue()).To(BeTrue())
+			})
+		})
 		Context("CalculateRetryDuration", func() {
 			DescribeTable("should calculate correct timeout based on queue length",
 				func(numCommands int, expectedDuration time.Duration) {
@@ -438,3 +521,62 @@ var _ = Describe("Queue", func() {
 		})
 	})
 })
+
+// failingStatusClient wraps a client.Client and fails status sub-resource patches for objects with the given
+// names to simulate partial failures when marking candidates as disrupted
+type failingStatusClient struct {
+	client.Client
+	failedNames sets.Set[string]
+}
+
+func (c *failingStatusClient) Status() client.SubResourceWriter {
+	return &failingStatusWriter{SubResourceWriter: c.Client.Status(), failedNames: c.failedNames}
+}
+
+type failingStatusWriter struct {
+	client.SubResourceWriter
+	failedNames sets.Set[string]
+}
+
+func (w *failingStatusWriter) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+	if w.failedNames.Has(obj.GetName()) {
+		return fmt.Errorf("induced status patch failure")
+	}
+	return w.SubResourceWriter.Patch(ctx, obj, patch, opts...)
+}
+
+// conditionRacingClient simulates another controller writing a status condition to the NodeClaim
+// between a Get and a Status().Patch call, racing with the patch that's about to be applied
+type conditionRacingClient struct {
+	client.Client
+	injected atomic.Bool
+}
+
+func newConditionRacingClient(c client.Client) *conditionRacingClient {
+	return &conditionRacingClient{Client: c}
+}
+
+func (c *conditionRacingClient) Status() client.SubResourceWriter {
+	return &conditionRacingStatusWriter{SubResourceWriter: c.Client.Status(), kubeClient: c.Client, injected: &c.injected}
+}
+
+type conditionRacingStatusWriter struct {
+	client.SubResourceWriter
+	kubeClient client.Client
+	injected   *atomic.Bool
+}
+
+func (s *conditionRacingStatusWriter) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+	if nc, ok := obj.(*v1.NodeClaim); ok && s.injected.CompareAndSwap(false, true) {
+		fresh := &v1.NodeClaim{}
+		if err := s.kubeClient.Get(ctx, client.ObjectKeyFromObject(nc), fresh); err != nil {
+			return err
+		}
+		stored := fresh.DeepCopy()
+		fresh.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
+		if err := s.kubeClient.Status().Patch(ctx, fresh, client.MergeFrom(stored)); err != nil {
+			return err
+		}
+	}
+	return s.SubResourceWriter.Patch(ctx, obj, patch, opts...)
+}

@@ -189,7 +189,7 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 	retryDuration := q.GetMaxRetryDuration()
 	// Wrap an error in an unrecoverable error if it timed out
 	defer func() {
-		if q.clock.Since(cmd.CreationTimestamp) > retryDuration {
+		if err != nil && q.clock.Since(cmd.CreationTimestamp) > retryDuration {
 			err = NewUnrecoverableError(serrors.Wrap(fmt.Errorf("command reached timeout, %w", err), "duration", q.clock.Since(cmd.CreationTimestamp)))
 		}
 	}()
@@ -267,7 +267,10 @@ func (q *Queue) markDisrupted(ctx context.Context, cmd *Command) ([]*Candidate, 
 			}
 			stored := nodeClaim.DeepCopy()
 			nodeClaim.StatusConditions(status.WithClock(q.clock)).SetTrueWithReason(v1.ConditionTypeDisruptionReason, string(cmd.Reason()), string(cmd.Reason()))
-			return q.kubeClient.Status().Patch(ctx, nodeClaim, client.MergeFrom(stored))
+			// We use client.MergeFromWithOptimisticLock because patching a list with a JSON merge patch
+			// can cause races due to the fact that it fully replaces the list on a change
+			// Here, we are updating the status condition list
+			return q.kubeClient.Status().Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))
 		}); err != nil {
 			errs[i] = client.IgnoreNotFound(err)
 			return
@@ -327,6 +330,11 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	// with disrupting the candidates. If it's just a delete operation, we can proceed
 	if markDisruptedErr != nil && (len(cmd.Replacements) > 0 || len(markedCandidates) == 0) {
 		return serrors.Wrap(fmt.Errorf("marking disrupted, %w", markDisruptedErr), "command-id", cmd.ID)
+	}
+	// If we proceed with only a subset of the candidates, log the failure for the candidates that we couldn't mark
+	// so that operators can see why these nodes were dropped from the command
+	if markDisruptedErr != nil {
+		log.FromContext(ctx).WithValues("command-id", cmd.ID).Error(markDisruptedErr, "failed marking candidates as disrupted, proceeding with the successfully marked candidates")
 	}
 
 	// Update the command to only consider the successfully MarkDisrupted candidates

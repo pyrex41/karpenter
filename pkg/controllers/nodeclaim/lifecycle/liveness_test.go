@@ -32,6 +32,7 @@ import (
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	nodeclaimlifecycle "sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/lifecycle"
+	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
@@ -155,6 +156,50 @@ var _ = Describe("Liveness", func() {
 		_ = ExpectObjectReconcileFailed(ctx, env.Client, nodeClaimController, nodeClaim)
 		ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
 		ExpectNotFound(ctx, env.Client, nodeClaim)
+	})
+	It("should only disrupt the NodeClaim for the launch timeout when both the launch and registration timeouts have elapsed", func() {
+		ExpectApplied(ctx, env.Client, nodePool)
+		nodeClaim := test.NodeClaim(v1.NodeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{
+					v1.NodePoolLabelKey: nodePool.Name,
+				},
+				OwnerReferences: []metav1.OwnerReference{
+					{
+						APIVersion:         object.GVK(nodePool).GroupVersion().String(),
+						Kind:               object.GVK(nodePool).Kind,
+						Name:               nodePool.Name,
+						UID:                nodePool.UID,
+						BlockOwnerDeletion: new(true),
+					},
+				},
+			},
+		})
+		metrics.NodeClaimsDisruptedTotal.Reset()
+		cloudProvider.AllowedCreateCalls = 0 // Don't allow Create() calls to succeed
+		ExpectApplied(ctx, env.Client, nodeClaim)
+		_ = ExpectObjectReconcileFailed(ctx, env.Client, nodeClaimController, nodeClaim)
+		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+
+		// Step past both the launch timeout and the registration timeout so that both timeout branches are eligible to fire
+		env.Clock.Step(time.Minute * 20)
+		_ = ExpectObjectReconcileFailed(ctx, env.Client, nodeClaimController, nodeClaim)
+		ExpectFinalizersRemoved(ctx, env.Client, nodeClaim)
+		ExpectNotFound(ctx, env.Client, nodeClaim)
+
+		// The NodeClaim should only be disrupted for the launch timeout, not also fall through to the registration timeout
+		ExpectMetricCounterValue(metrics.NodeClaimsDisruptedTotal, 1, map[string]string{
+			metrics.ReasonLabel:   "launch_timeout",
+			metrics.NodePoolLabel: nodePool.Name,
+		})
+		_, found := FindMetricWithLabelValues("karpenter_nodeclaims_disrupted_total", map[string]string{
+			metrics.ReasonLabel:   "registration_timeout",
+			metrics.NodePoolLabel: nodePool.Name,
+		})
+		Expect(found).To(BeFalse())
+		// A single failed launch should only record one failure against the NodePool's registration health so the
+		// NodeRegistrationHealthy status condition shouldn't be updated to False
+		operatorpkg.ExpectStatusConditions(ctx, env.Client, 1*time.Minute, nodePool, status.Condition{Type: v1.ConditionTypeNodeRegistrationHealthy, Status: metav1.ConditionUnknown})
 	})
 	It("should not delete the NodeClaim when the NodeClaim hasn't launched before the launch timeout", func() {
 		nodeClaim := test.NodeClaim(v1.NodeClaim{
