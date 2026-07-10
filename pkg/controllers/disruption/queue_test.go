@@ -17,7 +17,9 @@ limitations under the License.
 package disruption_test
 
 import (
+	"context"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -460,6 +462,31 @@ var _ = Describe("Queue", func() {
 			// And expect the nodeClaim and node to be deleted
 			ExpectNotFound(ctx, env.Client, nodeClaim2, node2)
 		})
+		Context("MarkDisrupted", func() {
+			It("should not clobber status conditions written concurrently by other controllers", func() {
+				ExpectApplied(ctx, env.Client, nodeClaim1, node1, nodePool)
+				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
+				stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
+
+				// Use a client that writes a status condition to the NodeClaim between the queue's Get and
+				// Status().Patch calls to simulate another controller updating the status conditions concurrently
+				racingClient := newConditionRacingClient(env.Client)
+				q := disruption.NewQueue(racingClient, recorder, cluster, env.Clock, prov)
+				cmd := &disruption.Command{
+					Method:            disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock),
+					CreationTimestamp: env.Clock.Now(),
+					ID:                uuid.New(),
+					Results:           scheduling.Results{},
+					Candidates:        []*disruption.Candidate{{StateNode: stateNode, NodePool: nodePool}},
+				}
+				Expect(q.StartCommand(ctx, cmd)).To(BeNil())
+
+				nodeClaim1 = ExpectExists(ctx, env.Client, nodeClaim1)
+				Expect(nodeClaim1.StatusConditions().Get(v1.ConditionTypeDisruptionReason).IsTrue()).To(BeTrue())
+				// The condition written by the other controller should not have been clobbered by the queue's patch
+				Expect(nodeClaim1.StatusConditions().Get(v1.ConditionTypeConsolidatable).IsTrue()).To(BeTrue())
+			})
+		})
 		Context("CalculateRetryDuration", func() {
 			DescribeTable("should calculate correct timeout based on queue length",
 				func(numCommands int, expectedDuration time.Duration) {
@@ -482,3 +509,39 @@ var _ = Describe("Queue", func() {
 		})
 	})
 })
+
+// conditionRacingClient simulates another controller writing a status condition to the NodeClaim
+// between a Get and a Status().Patch call, racing with the patch that's about to be applied
+type conditionRacingClient struct {
+	client.Client
+	injected atomic.Bool
+}
+
+func newConditionRacingClient(c client.Client) *conditionRacingClient {
+	return &conditionRacingClient{Client: c}
+}
+
+func (c *conditionRacingClient) Status() client.SubResourceWriter {
+	return &conditionRacingStatusWriter{SubResourceWriter: c.Client.Status(), kubeClient: c.Client, injected: &c.injected}
+}
+
+type conditionRacingStatusWriter struct {
+	client.SubResourceWriter
+	kubeClient client.Client
+	injected   *atomic.Bool
+}
+
+func (s *conditionRacingStatusWriter) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+	if nc, ok := obj.(*v1.NodeClaim); ok && s.injected.CompareAndSwap(false, true) {
+		fresh := &v1.NodeClaim{}
+		if err := s.kubeClient.Get(ctx, client.ObjectKeyFromObject(nc), fresh); err != nil {
+			return err
+		}
+		stored := fresh.DeepCopy()
+		fresh.StatusConditions().SetTrue(v1.ConditionTypeConsolidatable)
+		if err := s.kubeClient.Status().Patch(ctx, fresh, client.MergeFrom(stored)); err != nil {
+			return err
+		}
+	}
+	return s.SubResourceWriter.Patch(ctx, obj, patch, opts...)
+}
