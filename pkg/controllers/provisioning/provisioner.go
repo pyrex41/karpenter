@@ -56,6 +56,8 @@ import (
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/scheduling/dynamicresources"
+	shenschema "sigs.k8s.io/karpenter/pkg/shencore/schema"
+	shenrecorder "sigs.k8s.io/karpenter/pkg/shencore/recorder"
 	"sigs.k8s.io/karpenter/pkg/utils/daemonset"
 	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
@@ -89,6 +91,7 @@ type Provisioner struct {
 	cm                         *pretty.ChangeMonitor
 	clock                      clock.Clock
 	deviceAllocationController *deviceallocation.Controller
+	shenRecorder               *shenrecorder.Recorder
 }
 
 func NewProvisioner(kubeClient client.Client, recorder events.Recorder,
@@ -105,6 +108,7 @@ func NewProvisioner(kubeClient client.Client, recorder events.Recorder,
 		cm:                         pretty.NewChangeMonitor(),
 		clock:                      clock,
 		deviceAllocationController: deviceAllocationController,
+		shenRecorder:               shenrecorder.FromEnv(clock),
 	}
 	return p
 }
@@ -454,6 +458,20 @@ func (p *Provisioner) Schedule(ctx context.Context) (scheduler.Results, error) {
 		// these nodeClaims don't have a name until they are created
 		filterVirtualPodMapping(results.ExistingNodeToPodMapping()))
 	results.Record(ctx, p.recorder, p.cluster)
+	// Capture the (input, decision) pair as a golden corpus record when recording
+	// is enabled. Deep-reads only; nothing from live state is retained past this
+	// call. A recording failure must never fail a scheduling loop.
+	if p.shenRecorder.Enabled() {
+		if err := p.shenRecorder.RecordSolve(shenschema.SolveInput{
+			Clock:         p.clock.Now(),
+			Pods:          pods,
+			Nodes:         nodes.Active(),
+			NodePools:     s.NodePools(),
+			InstanceTypes: s.InstanceTypes(),
+		}, results); err != nil {
+			log.FromContext(ctx).Error(err, "recording shencore solve corpus")
+		}
+	}
 	return results, nil
 }
 

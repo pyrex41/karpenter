@@ -192,6 +192,7 @@ func NewScheduler(
 		allocator:               allocator,
 		instanceTypes:           instanceTypes,
 		cachedResourceClaims:    map[types.NamespacedName]*resourcev1.ResourceClaim{},
+		nodePools:               nodePools,
 	}
 
 	npByName := lo.SliceToMap(nodePools, func(np *v1.NodePool) (string, *v1.NodePool) {
@@ -256,7 +257,18 @@ type Scheduler struct {
 	instanceTypes map[string][]*cloudprovider.InstanceType
 	// cachedResourceClaims memoizes ResourceClaim lookups for the duration of a single scheduling loop.
 	cachedResourceClaims map[types.NamespacedName]*resourcev1.ResourceClaim
+	// nodePools is the ordered NodePool set this loop scheduled against, retained so the shencore recorder can
+	// serialize the full input snapshot (weight/limits/budgets/template) without re-listing.
+	nodePools []*v1.NodePool
 }
+
+// NodePools returns the NodePools this scheduler was built with. Exposed for the
+// shencore recorder to capture the Solve input snapshot.
+func (s *Scheduler) NodePools() []*v1.NodePool { return s.nodePools }
+
+// InstanceTypes returns the per-NodePool instance type catalog this scheduler was
+// built with. Exposed for the shencore recorder to content-address the catalog.
+func (s *Scheduler) InstanceTypes() map[string][]*cloudprovider.InstanceType { return s.instanceTypes }
 
 // DRAError indicates a pod will not be attempted to be scheduled because it has Dynamic Resource Allocation requirements
 // that are not yet supported by Karpenter

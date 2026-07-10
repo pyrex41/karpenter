@@ -21,3 +21,8 @@ bin/
 *.swp
 *.swo
 *~
+
+# shencore golden corpus: the full harvest is large and regenerable via
+# `make record-corpus`. A curated, committed sample lives in
+# test/parity/corpus-sample/ and is what CI replays.
+/test/parity/corpus/

@@ -48,6 +48,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	shenrecorder "sigs.k8s.io/karpenter/pkg/shencore/recorder"
 	"sigs.k8s.io/karpenter/pkg/state/cost"
 	nodepoolutils "sigs.k8s.io/karpenter/pkg/utils/nodepool"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
@@ -65,6 +66,7 @@ type Controller struct {
 	methods       []Method
 	mu            sync.Mutex
 	lastRun       map[string]time.Time
+	shenRecorder  *shenrecorder.Recorder
 }
 
 // pollingPeriod that we inspect cluster to look for opportunities to disrupt
@@ -95,6 +97,7 @@ func NewController(clk clock.Clock, kubeClient client.Client, provisioner *provi
 		clusterCost:   clusterCost,
 		lastRun:       map[string]time.Time{},
 		methods:       o.methods,
+		shenRecorder:  shenrecorder.FromEnv(clk),
 	}
 }
 
@@ -212,6 +215,10 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 	if err != nil {
 		return false, fmt.Errorf("computing disruption decision, %w", err)
 	}
+	// Record the full method decision (including no-ops) as a golden corpus pair
+	// before the no-op filter drops them, so a replay sees the same output the
+	// method produced.
+	c.recordDisrupt(ctx, disruption, candidates, disruptionBudgetMapping, cmds)
 	cmds = lo.Filter(cmds, func(c Command, _ int) bool { return c.Decision() != NoOpDecision })
 	if len(cmds) == 0 {
 		return false, nil
