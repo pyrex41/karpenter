@@ -254,6 +254,41 @@ var _ = Describe("Finalizer", func() {
 	})
 })
 
+var _ = Describe("Patch Conflicts", func() {
+	var nodePool *v1.NodePool
+
+	BeforeEach(func() {
+		nodePool = test.NodePool()
+	})
+	It("shouldn't overwrite status conditions written by another controller after the NodeClaim was read", func() {
+		nodeClaim := test.NodeClaim(v1.NodeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Labels: map[string]string{
+					v1.NodePoolLabelKey: nodePool.Name,
+				},
+				// Add the finalizer up-front so that the reconcile proceeds directly to the lifecycle reconcilers
+				Finalizers: []string{v1.TerminationFinalizer},
+			},
+		})
+		ExpectApplied(ctx, env.Client, nodePool, nodeClaim)
+		// Read the NodeClaim like the lifecycle controller would at the start of its reconcile
+		stale := ExpectExists(ctx, env.Client, nodeClaim)
+
+		// Simulate another controller (e.g. consistency) writing a status condition after our read
+		concurrent := ExpectExists(ctx, env.Client, nodeClaim)
+		concurrent.StatusConditions().SetFalse(v1.ConditionTypeConsistentStateFound, "FailedConsistencyCheck", "test")
+		Expect(env.Client.Status().Update(ctx, concurrent)).To(Succeed())
+
+		// Reconciling with the stale NodeClaim should requeue on the conflict rather than erasing the concurrent write
+		result, err := nodeClaimController.Reconcile(ctx, stale)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(result.Requeue).To(BeTrue())
+
+		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+		Expect(nodeClaim.StatusConditions().Get(v1.ConditionTypeConsistentStateFound).IsFalse()).To(BeTrue())
+	})
+})
+
 var _ = Describe("DRA Initialization Gating", func() {
 	var nodePool *v1.NodePool
 
