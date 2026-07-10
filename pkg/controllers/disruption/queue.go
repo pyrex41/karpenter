@@ -189,7 +189,7 @@ func (q *Queue) waitOrTerminate(ctx context.Context, cmd *Command) (err error) {
 	retryDuration := q.GetMaxRetryDuration()
 	// Wrap an error in an unrecoverable error if it timed out
 	defer func() {
-		if q.clock.Since(cmd.CreationTimestamp) > retryDuration {
+		if err != nil && q.clock.Since(cmd.CreationTimestamp) > retryDuration {
 			err = NewUnrecoverableError(serrors.Wrap(fmt.Errorf("command reached timeout, %w", err), "duration", q.clock.Since(cmd.CreationTimestamp)))
 		}
 	}()
