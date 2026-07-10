@@ -84,6 +84,7 @@ require (
 	github.com/spf13/cobra v1.10.2 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/stoewer/go-strcase v1.3.0 // indirect
+	github.com/tiancaiamao/shen-go v0.0.0-00010101000000-000000000000
 	github.com/x448/float16 v0.8.4 // indirect
 	go.opentelemetry.io/otel v1.44.0 // indirect
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
@@ -117,3 +118,5 @@ retract (
 	v0.34.4 // accidentally published incomplete patch release
 	v0.27.7 // accidentally published incomplete patch release
 )
+
+replace github.com/tiancaiamao/shen-go => ../shen/shen-go
