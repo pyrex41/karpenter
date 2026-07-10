@@ -438,6 +438,52 @@ var _ = Describe("HostPort Usage", func() {
 	})
 })
 
+var _ = Describe("Pod Disruption Cost", func() {
+	var nodeClaim *v1.NodeClaim
+	var node *corev1.Node
+	BeforeEach(func() {
+		instanceType := cloudProvider.InstanceTypes[0]
+		nodeClaim, node = test.NodeClaimAndNode(v1.NodeClaim{
+			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+				v1.NodePoolLabelKey:            nodePool.Name,
+				corev1.LabelInstanceTypeStable: instanceType.Name,
+			}},
+			Status: v1.NodeClaimStatus{
+				ProviderID: test.RandomProviderID(),
+			},
+		})
+	})
+	It("should maintain the pod disruption cost state when receiving NodeClaim updates", func() {
+		ExpectApplied(ctx, env.Client, nodeClaim, node)
+		ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
+		ExpectReconcileSucceeded(ctx, nodeController, client.ObjectKeyFromObject(node))
+		for range 2 {
+			pod := test.Pod(test.PodOptions{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						// 2^27 makes the eviction cost of each pod 1.0 + 2^27/2^27 = 2.0
+						corev1.PodDeletionCost: "134217728",
+					},
+				},
+			})
+			ExpectApplied(ctx, env.Client, pod)
+			ExpectManualBinding(ctx, env.Client, pod, node)
+			ExpectReconcileSucceeded(ctx, podController, client.ObjectKeyFromObject(pod))
+		}
+		ExpectStateNodeCount("==", 1)
+		stateNode := ExpectStateNodeExists(cluster, node)
+
+		// The node's disruption cost should be the base cost (1.0) plus the eviction cost of each pod (2.0)
+		Expect(stateNode.DisruptionCost()).To(BeNumerically("==", 5.0))
+
+		// Reconcile the nodeclaim one more time to ensure that we maintain our pod disruption cost state
+		ExpectReconcileSucceeded(ctx, nodeClaimController, client.ObjectKeyFromObject(nodeClaim))
+
+		stateNode = ExpectStateNodeExists(cluster, node)
+		Expect(stateNode.DisruptionCost()).To(BeNumerically("==", 5.0))
+	})
+})
+
 var _ = Describe("Node Deletion", func() {
 	It("should not leak a state node when the NodeClaim and Node names match", func() {
 		nodeClaim, node := test.NodeClaimAndNode(v1.NodeClaim{
