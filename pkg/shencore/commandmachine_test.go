@@ -14,12 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Table-driven tests for the disruption command ledger state machine
-// (command.shen), exercised through the shencore engine in interpreter mode.
-// The .shen file loads under (tc +), so a type error there fails these tests at
-// load time; these tests add the behavioral and totality (K1-wedge) coverage
-// that (tc +) does not.
-package command_test
+// Table-driven tests for the disruption command ledger state machine, loaded
+// through the shencore engine in interpreter mode: shen/types/command.shen (the
+// lifecycle datatypes + transition) and shen/core/command-machine.shen (the
+// pure ledger tick). Those files also load under (tc +) via `make shen-check`,
+// so a type error fails the build separately; these tests add the behavioral
+// and totality (K1-wedge) coverage that (tc +) does not.
+package shencore_test
 
 import (
 	"sync"
@@ -29,14 +30,18 @@ import (
 	"sigs.k8s.io/karpenter/pkg/shencore/sexpr"
 )
 
+// The .shen sources live at repo-root shen/; tests run with CWD at this package.
+var commandSources = []string{
+	"../../shen/types/command.shen",
+	"../../shen/core/command-machine.shen",
+}
+
 var (
-	engineOnce sync.Once
-	engine     *shencore.Engine
-	engineErr  error
+	cmdEngineOnce sync.Once
+	cmdEngine     *shencore.Engine
+	cmdEngineErr  error
 )
 
-// allStates and allEvents are the closed enumerations from command.shen. The
-// tests below rely on these being the complete sets.
 var (
 	allStates = []string{"pending", "tainted", "launching", "awaiting-ready", "deleting", "done", "rolled-back"}
 	allEvents = []string{"tick", "taint-ok", "taint-failed", "launched", "launch-failed", "registered", "deleted", "delete-failed"}
@@ -44,24 +49,23 @@ var (
 
 func nonTerminal(state string) bool { return state != "done" && state != "rolled-back" }
 
-func eng(t *testing.T) *shencore.Engine {
+func cmdEng(t *testing.T) *shencore.Engine {
 	t.Helper()
-	engineOnce.Do(func() {
-		engine, engineErr = shencore.New(shencore.Options{
+	cmdEngineOnce.Do(func() {
+		cmdEngine, cmdEngineErr = shencore.New(shencore.Options{
 			DefaultStepBudget: 2_000_000,
-			Interpret:         []string{"command.shen"},
+			Interpret:         commandSources,
 		})
 	})
-	if engineErr != nil {
-		t.Fatalf("load command.shen: %v", engineErr)
+	if cmdEngineErr != nil {
+		t.Fatalf("load command machine: %v", cmdEngineErr)
 	}
-	return engine
+	return cmdEngine
 }
 
-// step calls command-step's projections and returns (state', actions).
 func step(t *testing.T, state, event string, clock, created, retry int64) (string, []string) {
 	t.Helper()
-	e := eng(t)
+	e := cmdEng(t)
 	args := []sexpr.Value{sexpr.Symbol(state), sexpr.Symbol(event), sexpr.Int(clock), sexpr.Int(created), sexpr.Int(retry)}
 	st, err := e.Call("step-state", args...)
 	if err != nil {
@@ -128,8 +132,8 @@ func TestTransitionGridIsTotal(t *testing.T) {
 
 // TestNoNonTerminalDeadEnds asserts that from every non-terminal state there is
 // at least one event that makes progress (leaves the state), so no non-terminal
-// state is an absorbing trap. Combined with the totality test, this is the
-// "no wedge" guarantee.
+// state is an absorbing trap. With the totality test, this is the "no wedge"
+// guarantee.
 func TestNoNonTerminalDeadEnds(t *testing.T) {
 	for _, s := range allStates {
 		if !nonTerminal(s) {
@@ -137,8 +141,7 @@ func TestNoNonTerminalDeadEnds(t *testing.T) {
 		}
 		progressed := false
 		for _, ev := range allEvents {
-			// Use a timed-out clock so `tick` can drive rollback where defined.
-			got, _ := step(t, s, ev, 1000, 0, 100)
+			got, _ := step(t, s, ev, 1000, 0, 100) // timed-out clock so `tick` can drive rollback
 			if got != s {
 				progressed = true
 				break
@@ -196,13 +199,11 @@ func TestFailureRollbacks(t *testing.T) {
 // before.
 func TestTimeout(t *testing.T) {
 	for _, s := range []string{"tainted", "launching", "awaiting-ready"} {
-		// Within budget: tick is a self-loop with no actions.
-		gotState, gotActs := step(t, s, "tick", 50, 0, 100)
+		gotState, gotActs := step(t, s, "tick", 50, 0, 100) // within budget
 		if gotState != s || len(gotActs) != 0 {
 			t.Errorf("%s x tick within budget: (%q,%v), want (%q,[])", s, gotState, gotActs, s)
 		}
-		// Past budget: rollback with cleanup.
-		gotState, gotActs = step(t, s, "tick", 500, 0, 100)
+		gotState, gotActs = step(t, s, "tick", 500, 0, 100) // past budget
 		if gotState != "rolled-back" || !eqStrs(gotActs, []string{"remove-taint", "clear-condition"}) {
 			t.Errorf("%s x tick past budget: (%q,%v), want rolled-back+cleanup", s, gotState, gotActs)
 		}
@@ -242,10 +243,9 @@ func idEvent(id, event string) sexpr.Value {
 	return sexpr.List{sexpr.String(id), sexpr.Symbol(event)}
 }
 
-// ledgerTick returns (ledger', actions) as decoded Go structures.
 func ledgerTick(t *testing.T, ledger, events sexpr.List, clock, retry int64) (sexpr.List, sexpr.List) {
 	t.Helper()
-	e := eng(t)
+	e := cmdEng(t)
 	args := []sexpr.Value{ledger, events, sexpr.Int(clock), sexpr.Int(retry)}
 	l, err := e.Call("ledger-next", args...)
 	if err != nil {
@@ -258,8 +258,9 @@ func ledgerTick(t *testing.T, ledger, events sexpr.List, clock, retry int64) (se
 	return l.(sexpr.List), a.(sexpr.List)
 }
 
-// entryState pulls the state symbol out of a decoded ledger entry.
-func entryState(t *testing.T, v sexpr.Value) (id, state string) {
+// pair pulls the (id, tag) out of a decoded [id tag ...] list (ledger entry or
+// id-action).
+func pair(t *testing.T, v sexpr.Value) (id, tag string) {
 	t.Helper()
 	l := v.(sexpr.List)
 	return string(l[0].(sexpr.String)), string(l[1].(sexpr.Symbol))
@@ -278,19 +279,18 @@ func TestLedgerTickMultiEntry(t *testing.T) {
 	}
 	wantStates := map[string]string{"c1": "tainted", "c2": "deleting"}
 	for _, e := range nextLedger {
-		id, st := entryState(t, e)
+		id, st := pair(t, e)
 		if wantStates[id] != st {
 			t.Errorf("ledger' %s = %q, want %q", id, st, wantStates[id])
 		}
 	}
 
-	// Actions are tagged with their decision-id: (c1 apply-taint), (c2 delete-candidates).
 	wantActions := map[string]string{"c1": "apply-taint", "c2": "delete-candidates"}
 	if len(actions) != 2 {
 		t.Fatalf("actions = %d, want 2 (%v)", len(actions), actions)
 	}
 	for _, a := range actions {
-		id, act := entryState(t, a)
+		id, act := pair(t, a)
 		if wantActions[id] != act {
 			t.Errorf("action for %s = %q, want %q", id, act, wantActions[id])
 		}
@@ -304,16 +304,14 @@ func TestLedgerQuietTickDrivesTimeout(t *testing.T) {
 	ledger := sexpr.List{entry("stalled", "awaiting-ready", 0)}
 	nextLedger, actions := ledgerTick(t, ledger, sexpr.List{}, 500, 100)
 
-	_, st := entryState(t, nextLedger[0])
-	if st != "rolled-back" {
+	if _, st := pair(t, nextLedger[0]); st != "rolled-back" {
 		t.Errorf("stalled command state = %q, want rolled-back", st)
 	}
-	// Cleanup actions emitted, tagged with the id.
 	if len(actions) != 2 {
 		t.Fatalf("actions = %v, want two cleanup actions", actions)
 	}
 	for _, a := range actions {
-		id, act := entryState(t, a)
+		id, act := pair(t, a)
 		if id != "stalled" || (act != "remove-taint" && act != "clear-condition") {
 			t.Errorf("unexpected action %s/%s", id, act)
 		}
@@ -321,7 +319,7 @@ func TestLedgerQuietTickDrivesTimeout(t *testing.T) {
 }
 
 func TestLedgerGCDropsTerminal(t *testing.T) {
-	e := eng(t)
+	e := cmdEng(t)
 	ledger := sexpr.List{
 		entry("a", "done", 0),
 		entry("b", "tainted", 0),
@@ -335,7 +333,7 @@ func TestLedgerGCDropsTerminal(t *testing.T) {
 	if len(kept) != 1 {
 		t.Fatalf("gc kept %d entries, want 1 (%v)", len(kept), kept)
 	}
-	if id, st := entryState(t, kept[0]); id != "b" || st != "tainted" {
+	if id, st := pair(t, kept[0]); id != "b" || st != "tainted" {
 		t.Errorf("gc kept %s/%s, want b/tainted", id, st)
 	}
 }

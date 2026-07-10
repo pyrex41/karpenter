@@ -27,16 +27,34 @@ package main
 import (
 	"fmt"
 	"os"
+	"sort"
+	"strings"
 
 	"sigs.k8s.io/karpenter/pkg/shencore"
 )
 
+// layerRank orders files so datatype declarations load before the logic that
+// references them: shen/types first, then shen/core, then anything else. This
+// lets callers pass an arbitrary (e.g. lexically sorted) file list — the load
+// order that (tc +) needs is imposed here.
+func layerRank(path string) int {
+	switch {
+	case strings.Contains(path, "/types/"):
+		return 0
+	case strings.Contains(path, "/core/"):
+		return 1
+	default:
+		return 2
+	}
+}
+
 func main() {
-	files := os.Args[1:]
+	files := append([]string(nil), os.Args[1:]...)
 	if len(files) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: shen-check <file.shen>...")
 		os.Exit(2)
 	}
+	sort.SliceStable(files, func(i, j int) bool { return layerRank(files[i]) < layerRank(files[j]) })
 
 	engine, err := shencore.New(shencore.Options{})
 	if err != nil {
