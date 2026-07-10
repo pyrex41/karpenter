@@ -113,6 +113,20 @@ test: ## Run tests
 test-memory: ## Run memory usage tests for node overlay store
 	go test -v ./pkg/controllers/nodeoverlay/... -run TestMemoryUsage
 
+CORPUS_DIR ?= $(shell pwd)/test/parity/corpus
+
+record-corpus: ## Harvest the shencore golden sexpr corpus from the provisioning + disruption suites (needs KUBEBUILDER_ASSETS)
+	rm -rf $(CORPUS_DIR)
+	mkdir -p $(CORPUS_DIR)
+	SHENCORE_RECORD_DIR=$(CORPUS_DIR) go test \
+		./pkg/controllers/provisioning/... \
+		./pkg/controllers/disruption/... \
+		-timeout 40m
+	@echo "corpus records: $$(find $(CORPUS_DIR) -name '*.sexpr' | wc -l | tr -d ' '), size: $$(du -sh $(CORPUS_DIR) | cut -f1)"
+
+parity: ## Replay the golden corpus and assert byte-stability + engine parity
+	go test ./test/parity/... -v
+
 shen-check: ## Type-check the Shen decision sources under (tc +)
 	go run ./hack/shen-check $$(find shen -name '*.shen' | sort)
 
