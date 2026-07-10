@@ -113,6 +113,12 @@ test: ## Run tests
 test-memory: ## Run memory usage tests for node overlay store
 	go test -v ./pkg/controllers/nodeoverlay/... -run TestMemoryUsage
 
+shen-check: ## Type-check the Shen decision sources under (tc +)
+	go run ./hack/shen-check $$(find shen -name '*.shen' | sort)
+
+shen-test: shen-check ## Type-check and run the Shen decision-core Go tests
+	go test ./pkg/shencore/... ./shen/...
+
 test-dra: ## Run DRA KWOK driver unit tests
 	go test ./dra-kwok-driver/pkg/... \
 		-race \
@@ -187,4 +193,4 @@ download: ## Recursively "go mod download" on all directories where go.mod exist
 gen_instance_types:
 	go run kwok/tools/gen_instance_types.go > kwok/cloudprovider/instance_types.json
 
-.PHONY: help presubmit install-kwok uninstall-kwok build apply delete test test-memory test-dra e2etest-dra benchmark deflake vulncheck licenses verify download gen_instance_types setup-kind-dra delete-kind-dra apply-with-kind-dra
+.PHONY: help presubmit install-kwok uninstall-kwok build apply delete test test-memory shen-check shen-test test-dra e2etest-dra benchmark deflake vulncheck licenses verify download gen_instance_types setup-kind-dra delete-kind-dra apply-with-kind-dra

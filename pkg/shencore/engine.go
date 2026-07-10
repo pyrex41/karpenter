@@ -237,6 +237,23 @@ func (e *Engine) callLocked(stepBudget int64, fn string, args ...kl.Obj) (res kl
 	return out, nil
 }
 
+// EnableTypecheck turns on Shen's sequent-calculus type checker for subsequent
+// LoadFile calls. Shen's loader samples the typecheck flag once at the start of
+// each file, so this must be called BEFORE the LoadFile whose sources should be
+// checked; a type error then surfaces as that LoadFile's error. This is the
+// mechanism behind the `shen-check` build gate.
+func (e *Engine) EnableTypecheck() error { return e.setTypecheck("+") }
+
+// DisableTypecheck turns the type checker back off for subsequent LoadFile calls.
+func (e *Engine) DisableTypecheck() error { return e.setTypecheck("-") }
+
+func (e *Engine) setTypecheck(sign string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	_, err := e.callLocked(0, "tc", kl.MakeSymbol(sign))
+	return err
+}
+
 // LoadedFiles returns the .shen files loaded through this Engine, in load order.
 func (e *Engine) LoadedFiles() []string {
 	e.mu.Lock()
