@@ -92,6 +92,11 @@ func NewNodeClaim(
 ) *NodeClaim {
 	hostname := fmt.Sprintf("hostname-placeholder-%04d", atomic.AddInt64(&nodeID, 1))
 	template := *nodeClaimTemplate
+	// template is a shallow copy of the shared NodeClaimTemplate, so its Annotations map is aliased
+	// across every NodeClaim built from that template. Give this NodeClaim its own copy: the scheduler
+	// writes per-NodeClaim annotations (e.g. the minValues-relaxed annotation) during a single Solve,
+	// and a shared map would let one NodeClaim's write clobber its siblings' (last writer wins).
+	template.Annotations = lo.Assign(nodeClaimTemplate.Annotations)
 	template.Requirements = scheduling.NewRequirements()
 	template.Requirements.Add(nodeClaimTemplate.Requirements.Values()...)
 	template.Requirements.Add(scheduling.NewRequirement(corev1.LabelHostname, corev1.NodeSelectorOpIn, hostname))
@@ -212,9 +217,19 @@ func (n *NodeClaim) tryVolumeAlternative(ctx context.Context, pod *corev1.Pod, p
 
 	remaining, unsatisfiableKeys, err := filterInstanceTypesByRequirements(n.InstanceTypeOptions, nodeClaimRequirements, pod, podData.Requests, n.daemonOverheadGroups, requests, relaxMinValues)
 	if relaxMinValues {
-		// Update min values on the requirements if they are relaxed
+		// Update min values on the requirements if they are relaxed.
+		// We must not mutate the existing *Requirement in place: NewRequirements aliases the
+		// *Requirement pointers it's given (Requirements.Add stores them by reference when there's
+		// no key collision), so the entry here is typically shared with baseRequirements, the
+		// NodeClaim's requirements, and the scheduler-wide NodeClaimTemplate. Mutating it would
+		// poison the template and every sibling NodeClaim in this scheduling pass, and would defeat
+		// the relaxed-minValues detection in addToNewNodeClaim, which compares these returned
+		// requirements against the NodeClaim's original (template) MinValues. Instead, copy-on-write:
+		// replace the entry with a fresh requirement carrying the relaxed MinValues.
 		for key, minValues := range unsatisfiableKeys {
-			nodeClaimRequirements.Get(key).MinValues = new(minValues)
+			relaxed := nodeClaimRequirements.Get(key).DeepCopy()
+			relaxed.MinValues = new(minValues)
+			nodeClaimRequirements[key] = relaxed
 		}
 	}
 	if err != nil {

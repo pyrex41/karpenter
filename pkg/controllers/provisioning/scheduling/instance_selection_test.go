@@ -23,14 +23,17 @@ import (
 	"github.com/mitchellh/hashstructure/v2"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider/fake"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning/scheduling"
+	"sigs.k8s.io/karpenter/pkg/operator/options"
 	scheduler "sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -618,6 +621,88 @@ var _ = Describe("Instance Type Selection", func() {
 		Expect(node.Labels[corev1.LabelInstanceTypeStable]).To(Equal("test-instance1"))
 	})
 	Context("MinValues", func() {
+		It("should relax minValues without leaking the relaxed floor onto sibling NodeClaims in the same batch", func() {
+			// BestEffort lets Karpenter relax minValues for a NodeClaim that can't satisfy them.
+			// Use a local context so the policy override doesn't leak into sibling specs (ctx is set once in BeforeSuite).
+			ctx := options.ToContext(ctx, test.Options(test.OptionsFields{MinValuesPolicy: new(options.MinValuesPolicyBestEffort)}))
+
+			// Three distinct instance types. Only instance-type-1 has enough CPU for the "large" pod,
+			// so its NodeClaim can offer a single instance type and must relax the minValues=3 floor.
+			// The "small" pod fits all three, so its NodeClaim must keep the minValues=3 floor.
+			offering := cloudprovider.Offering{
+				Available:    true,
+				Requirements: scheduler.NewLabelRequirements(map[string]string{v1.CapacityTypeLabelKey: v1.CapacityTypeSpot, corev1.LabelTopologyZone: "test-zone-1-spot"}),
+				Price:        1.0,
+			}
+			cloudProvider.InstanceTypes = []*cloudprovider.InstanceType{
+				fake.NewInstanceType("instance-type-1", fake.WithArchitecture(v1.ArchitectureArm64), fake.WithOperatingSystems(string(corev1.Linux)),
+					fake.WithResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("16"), corev1.ResourceMemory: resource.MustParse("16Gi")}), fake.WithOfferings(offering)),
+				fake.NewInstanceType("instance-type-2", fake.WithArchitecture(v1.ArchitectureArm64), fake.WithOperatingSystems(string(corev1.Linux)),
+					fake.WithResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi")}), fake.WithOfferings(offering)),
+				fake.NewInstanceType("instance-type-3", fake.WithArchitecture(v1.ArchitectureArm64), fake.WithOperatingSystems(string(corev1.Linux)),
+					fake.WithResources(corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi")}), fake.WithOfferings(offering)),
+			}
+
+			nodePool.Spec.Template.Spec.Requirements = []v1.NodeSelectorRequirementWithMinValues{
+				{
+					Key:       corev1.LabelInstanceTypeStable,
+					Operator:  corev1.NodeSelectorOpIn,
+					Values:    []string{"instance-type-1", "instance-type-2", "instance-type-3"},
+					MinValues: new(3),
+				},
+			}
+			ExpectApplied(ctx, env.Client, nodePool)
+
+			// Anti-affinity forces the two pods onto separate NodeClaims within the same scheduling batch,
+			// which is where an in-place mutation of the shared instance-type requirement would leak.
+			antiAffinity := []corev1.PodAffinityTerm{{
+				LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "minvalues-leak"}},
+				TopologyKey:   corev1.LabelHostname,
+			}}
+			largePod := test.UnschedulablePod(test.PodOptions{
+				ObjectMeta:          metav1.ObjectMeta{Labels: map[string]string{"app": "minvalues-leak"}},
+				PodAntiRequirements: antiAffinity,
+				ResourceRequirements: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+					corev1.ResourceCPU: resource.MustParse("2")}},
+			})
+			smallPod := test.UnschedulablePod(test.PodOptions{
+				ObjectMeta:          metav1.ObjectMeta{Labels: map[string]string{"app": "minvalues-leak"}},
+				PodAntiRequirements: antiAffinity,
+				ResourceRequirements: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+					corev1.ResourceCPU: resource.MustParse("0.5")}},
+			})
+
+			ExpectProvisioned(ctx, env.Client, cluster, cloudProvider, prov, largePod, smallPod)
+			ExpectScheduled(ctx, env.Client, largePod)
+			ExpectScheduled(ctx, env.Client, smallPod)
+			Expect(cloudProvider.CreateCalls).To(HaveLen(2))
+
+			// Identify the two NodeClaims by their CPU request (independent of the buggy code path):
+			// the large pod (2 CPU) only fits instance-type-1, so its NodeClaim must relax the floor;
+			// the small pod (0.5 CPU) fits all three, so its NodeClaim must keep the floor.
+			relaxed, foundRelaxed := lo.Find(cloudProvider.CreateCalls, func(nc *v1.NodeClaim) bool {
+				return nc.Spec.Resources.Requests.Cpu().Cmp(resource.MustParse("2")) == 0
+			})
+			strict, foundStrict := lo.Find(cloudProvider.CreateCalls, func(nc *v1.NodeClaim) bool {
+				return nc.Spec.Resources.Requests.Cpu().Cmp(resource.MustParse("500m")) == 0
+			})
+			Expect(foundRelaxed).To(BeTrue())
+			Expect(foundStrict).To(BeTrue())
+
+			minValuesFor := func(nc *v1.NodeClaim) *int {
+				return scheduler.NewNodeSelectorRequirementsWithMinValues(nc.Spec.Requirements...).Get(corev1.LabelInstanceTypeStable).MinValues
+			}
+
+			// The relaxed NodeClaim carries the lowered floor and is annotated as relaxed.
+			Expect(lo.FromPtr(minValuesFor(relaxed))).To(Equal(1))
+			Expect(relaxed.Annotations).To(HaveKeyWithValue(v1.NodeClaimMinValuesRelaxedAnnotationKey, "true"))
+
+			// The sibling NodeClaim must still be held to the NodePool's declared minValues and must not
+			// be silently flagged as relaxed. Before the fix, the in-place mutation poisoned the shared
+			// requirement so this NodeClaim inherited MinValues=1 and reported "false" for a lowered floor.
+			Expect(lo.FromPtr(minValuesFor(strict))).To(Equal(3))
+			Expect(strict.Annotations).To(HaveKeyWithValue(v1.NodeClaimMinValuesRelaxedAnnotationKey, "false"))
+		})
 		It("should schedule respecting the minValues from instance-type requirements", func() {
 			var instanceTypes []*cloudprovider.InstanceType
 			// Create fake InstanceTypeOptions where one instances can fit 2 pods and another one can fit only 1 pod.
