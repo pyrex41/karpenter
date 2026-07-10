@@ -176,11 +176,35 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (re
 	}
 	if !equality.Semantic.DeepEqual(stored, nodeClaim) {
 		statusCopy := nodeClaim.DeepCopy()
-		if err := c.kubeClient.Patch(ctx, nodeClaim, client.MergeFrom(stored)); err != nil {
+		// We use client.MergeFromWithOptimisticLock because patching a list with a JSON merge patch
+		// can cause races due to the fact that it fully replaces the list on a change
+		// Locking the metadata patch also ensures that the status patch below can safely base itself off of
+		// the response of this patch since no other writer could have modified the NodeClaim in between
+		if err := c.kubeClient.Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{})); err != nil {
+			if errors.IsConflict(err) {
+				if errs != nil {
+					return reconcile.Result{}, errs
+				}
+				return reconcile.Result{Requeue: true}, nil
+			}
 			return reconcile.Result{}, client.IgnoreNotFound(multierr.Append(errs, err))
 		}
 
-		if err := c.kubeClient.Status().Patch(ctx, statusCopy, client.MergeFrom(stored)); err != nil {
+		// The metadata patch above refreshed nodeClaim with the apiserver's response, so we base the status patch
+		// off of this version to ensure the optimistic lock only conflicts on writes from other writers and not
+		// on the resourceVersion change from our own metadata patch
+		latest := nodeClaim.DeepCopy()
+		nodeClaim.Status = statusCopy.Status
+		// We use client.MergeFromWithOptimisticLock because patching a list with a JSON merge patch
+		// can cause races due to the fact that it fully replaces the list on a change
+		// Here, we are updating the status condition list
+		if err := c.kubeClient.Status().Patch(ctx, nodeClaim, client.MergeFromWithOptions(latest, client.MergeFromWithOptimisticLock{})); err != nil {
+			if errors.IsConflict(err) {
+				if errs != nil {
+					return reconcile.Result{}, errs
+				}
+				return reconcile.Result{Requeue: true}, nil
+			}
 			return reconcile.Result{}, client.IgnoreNotFound(multierr.Append(errs, err))
 		}
 		// We sleep here after a patch operation since we want to ensure that we are able to read our own writes
