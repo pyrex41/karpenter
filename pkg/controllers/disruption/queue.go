@@ -267,7 +267,10 @@ func (q *Queue) markDisrupted(ctx context.Context, cmd *Command) ([]*Candidate, 
 			}
 			stored := nodeClaim.DeepCopy()
 			nodeClaim.StatusConditions(status.WithClock(q.clock)).SetTrueWithReason(v1.ConditionTypeDisruptionReason, string(cmd.Reason()), string(cmd.Reason()))
-			return q.kubeClient.Status().Patch(ctx, nodeClaim, client.MergeFrom(stored))
+			// We use client.MergeFromWithOptimisticLock because patching a list with a JSON merge patch
+			// can cause races due to the fact that it fully replaces the list on a change
+			// Here, we are updating the status condition list
+			return q.kubeClient.Status().Patch(ctx, nodeClaim, client.MergeFromWithOptions(stored, client.MergeFromWithOptimisticLock{}))
 		}); err != nil {
 			errs[i] = client.IgnoreNotFound(err)
 			return
