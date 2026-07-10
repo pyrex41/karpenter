@@ -331,6 +331,11 @@ func (q *Queue) StartCommand(ctx context.Context, cmd *Command) error {
 	if markDisruptedErr != nil && (len(cmd.Replacements) > 0 || len(markedCandidates) == 0) {
 		return serrors.Wrap(fmt.Errorf("marking disrupted, %w", markDisruptedErr), "command-id", cmd.ID)
 	}
+	// If we proceed with only a subset of the candidates, log the failure for the candidates that we couldn't mark
+	// so that operators can see why these nodes were dropped from the command
+	if markDisruptedErr != nil {
+		log.FromContext(ctx).WithValues("command-id", cmd.ID).Error(markDisruptedErr, "failed marking candidates as disrupted, proceeding with the successfully marked candidates")
+	}
 
 	// Update the command to only consider the successfully MarkDisrupted candidates
 	cmd.Candidates = markedCandidates

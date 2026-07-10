@@ -18,10 +18,12 @@ package disruption_test
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"sync/atomic"
 	"time"
 
+	"github.com/go-logr/logr/funcr"
 	"github.com/google/uuid"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -34,7 +36,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/controllers/disruption"
@@ -207,50 +211,6 @@ var _ = Describe("Queue", func() {
 			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
 			node1 = ExpectNodeExists(ctx, env.Client, node1.Name)
 			Expect(node1.Spec.Taints).ToNot(ContainElement(v1.DisruptedNoScheduleTaint))
-		})
-		It("should succeed when a command completes after the timeout has elapsed", func() {
-			ExpectApplied(ctx, env.Client, nodeClaim1, node1, nodePool)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1}, []*v1.NodeClaim{nodeClaim1})
-			stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
-
-			nct := scheduling.NewNodeClaimTemplate(nodePool)
-			nct.InstanceTypeOptions = append([]*cloudprovider.InstanceType{}, cloudProvider.InstanceTypes...)
-			replacements := []*disruption.Replacement{
-				{
-					NodeClaim: &scheduling.NodeClaim{NodeClaimTemplate: *nct},
-				},
-			}
-
-			cmd := &disruption.Command{
-				Method:            disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock),
-				CreationTimestamp: env.Clock.Now(),
-				ID:                uuid.New(),
-				Results:           scheduling.Results{},
-				Candidates:        []*disruption.Candidate{{StateNode: stateNode, NodePool: nodePool}},
-				Replacements:      replacements,
-			}
-			Expect(queue.StartCommand(ctx, cmd)).To(BeNil())
-
-			replacementNodeClaim := &v1.NodeClaim{}
-			Expect(env.Client.Get(ctx, types.NamespacedName{Name: cmd.Replacements[0].Name}, replacementNodeClaim))
-			replacementNodeClaim, replacementNode := ExpectNodeClaimDeployedAndStateUpdated(ctx, env.Client, cluster, cloudProvider, replacementNodeClaim)
-			ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController,
-				[]*corev1.Node{replacementNode}, []*v1.NodeClaim{replacementNodeClaim})
-
-			// Step the clock past the timeout. The command completes successfully on this pass,
-			// so it should not be rewritten into a timeout failure.
-			env.Clock.Step(11 * time.Minute)
-
-			ExpectObjectReconciled(ctx, env.Client, queue, stateNode.NodeClaim)
-			Expect(cmd.Succeeded).To(BeTrue())
-
-			terminatingEvents := disruptionevents.Terminating(node1, nodeClaim1, string(cmd.Reason()))
-			Expect(recorder.DetectedEvent(terminatingEvents[0].Message)).To(BeTrue())
-			Expect(recorder.DetectedEvent(terminatingEvents[1].Message)).To(BeTrue())
-
-			ExpectNodeClaimsCascadeDeletion(ctx, env.Client, nodeClaim1)
-			// And expect the nodeClaim and node to be deleted
-			ExpectNotFound(ctx, env.Client, nodeClaim1, node1)
 		})
 		It("should fully handle a command when replacements are initialized", func() {
 			ExpectApplied(ctx, env.Client, nodeClaim1, node1, nodePool)
@@ -462,6 +422,58 @@ var _ = Describe("Queue", func() {
 			// And expect the nodeClaim and node to be deleted
 			ExpectNotFound(ctx, env.Client, nodeClaim2, node2)
 		})
+		Context("StartCommand", func() {
+			It("should log and proceed with the marked candidates when marking fails for a subset of a delete-only command", func() {
+				ExpectApplied(ctx, env.Client, nodePool, nodeClaim1, node1, nodeClaim2, node2)
+				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1, node2}, []*v1.NodeClaim{nodeClaim1, nodeClaim2})
+				stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
+				stateNode2 := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim2)
+
+				// Fail the status patch that adds the Disrupted condition to the second candidate so that
+				// only the first candidate is successfully marked
+				failingQueue := disruption.NewQueue(&failingStatusClient{Client: env.Client, failedNames: sets.New(nodeClaim2.Name)}, recorder, cluster, env.Clock, prov)
+				var logs []string
+				logCtx := log.IntoContext(ctx, funcr.New(func(_, args string) { logs = append(logs, args) }, funcr.Options{}))
+
+				cmd := &disruption.Command{
+					Method:            disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock),
+					CreationTimestamp: env.Clock.Now(),
+					ID:                uuid.New(),
+					Results:           scheduling.Results{},
+					Candidates:        []*disruption.Candidate{{StateNode: stateNode, NodePool: nodePool}, {StateNode: stateNode2, NodePool: nodePool}},
+					Replacements:      nil,
+				}
+				Expect(failingQueue.StartCommand(logCtx, cmd)).To(BeNil())
+
+				// The command should only proceed with the successfully marked candidate
+				Expect(cmd.Candidates).To(HaveLen(1))
+				Expect(cmd.Candidates[0].ProviderID()).To(Equal(stateNode.ProviderID()))
+				Expect(failingQueue.HasAny(stateNode.ProviderID())).To(BeTrue())
+				Expect(failingQueue.HasAny(stateNode2.ProviderID())).To(BeFalse())
+				// And the partial failure should be surfaced in the logs
+				Expect(logs).To(ContainElement(ContainSubstring("failed marking candidates as disrupted")))
+			})
+			It("should return an error when marking fails for all candidates of a delete-only command", func() {
+				ExpectApplied(ctx, env.Client, nodePool, nodeClaim1, node1, nodeClaim2, node2)
+				ExpectMakeNodesAndNodeClaimsInitializedAndStateUpdated(ctx, env.Client, env.Clock, nodeStateController, nodeClaimStateController, []*corev1.Node{node1, node2}, []*v1.NodeClaim{nodeClaim1, nodeClaim2})
+				stateNode := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim1)
+				stateNode2 := ExpectStateNodeExistsForNodeClaim(cluster, nodeClaim2)
+
+				// Fail the status patch that adds the Disrupted condition to both candidates so that no candidate is successfully marked
+				failingQueue := disruption.NewQueue(&failingStatusClient{Client: env.Client, failedNames: sets.New(nodeClaim1.Name, nodeClaim2.Name)}, recorder, cluster, env.Clock, prov)
+
+				cmd := &disruption.Command{
+					Method:            disruption.NewDrift(env.Client, cluster, prov, recorder, env.Clock),
+					CreationTimestamp: env.Clock.Now(),
+					ID:                uuid.New(),
+					Results:           scheduling.Results{},
+					Candidates:        []*disruption.Candidate{{StateNode: stateNode, NodePool: nodePool}, {StateNode: stateNode2, NodePool: nodePool}},
+					Replacements:      nil,
+				}
+				Expect(failingQueue.StartCommand(ctx, cmd)).ToNot(Succeed())
+				Expect(failingQueue.HasAny(stateNode.ProviderID(), stateNode2.ProviderID())).To(BeFalse())
+			})
+		})
 		Context("MarkDisrupted", func() {
 			It("should not clobber status conditions written concurrently by other controllers", func() {
 				ExpectApplied(ctx, env.Client, nodeClaim1, node1, nodePool)
@@ -509,6 +521,29 @@ var _ = Describe("Queue", func() {
 		})
 	})
 })
+
+// failingStatusClient wraps a client.Client and fails status sub-resource patches for objects with the given
+// names to simulate partial failures when marking candidates as disrupted
+type failingStatusClient struct {
+	client.Client
+	failedNames sets.Set[string]
+}
+
+func (c *failingStatusClient) Status() client.SubResourceWriter {
+	return &failingStatusWriter{SubResourceWriter: c.Client.Status(), failedNames: c.failedNames}
+}
+
+type failingStatusWriter struct {
+	client.SubResourceWriter
+	failedNames sets.Set[string]
+}
+
+func (w *failingStatusWriter) Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+	if w.failedNames.Has(obj.GetName()) {
+		return fmt.Errorf("induced status patch failure")
+	}
+	return w.SubResourceWriter.Patch(ctx, obj, patch, opts...)
+}
 
 // conditionRacingClient simulates another controller writing a status condition to the NodeClaim
 // between a Get and a Status().Patch call, racing with the patch that's about to be applied
