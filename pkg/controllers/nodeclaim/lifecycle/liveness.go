@@ -83,8 +83,8 @@ func (l *Liveness) Reconcile(ctx context.Context, nodeClaim *v1.NodeClaim) (reco
 			if client.IgnoreNotFound(err) != nil {
 				return reconcile.Result{}, err
 			}
-			return reconcile.Result{}, nil
 		}
+		return reconcile.Result{}, nil
 	}
 	if registered == nil {
 		return reconcile.Result{Requeue: true}, nil
