@@ -31,10 +31,15 @@ import (
 )
 
 const (
-	// shenDisruptionEntrypoint is the Shen function the disruption core exposes.
-	// It takes the schema (input ...) form and returns the (output ...) form.
-	// This is the contract handed off to the Shen disruption decision core.
-	shenDisruptionEntrypoint = "shencore.disrupt"
+	// defaultDisruptionEntrypoint is the Shen function the decider calls. It takes
+	// the schema (input ...) form and returns the (output ...) form. The real
+	// shen/core/disruption.shen planner exposes its decision as native typed values
+	// (plan-commands over candidate/pool-budget lists), so bridging it to this wire
+	// contract needs an adapter function; that adapter's name is set via
+	// SHENCORE_DISRUPTION_ENTRYPOINT so this Go seam needs no change to adopt it.
+	defaultDisruptionEntrypoint = "shencore.disrupt"
+	// envDisruptionEntrypoint overrides the entrypoint function name.
+	envDisruptionEntrypoint = "SHENCORE_DISRUPTION_ENTRYPOINT"
 	// envDisruptionSource overrides the path to shen/core/disruption.shen for the
 	// interpreter dev-mode loader.
 	envDisruptionSource = "SHENCORE_DISRUPTION_SOURCE"
@@ -49,6 +54,14 @@ func disruptionSourcePath() string {
 		return p
 	}
 	return defaultDisruptionSource
+}
+
+// disruptionEntrypoint resolves the Shen decision entrypoint function name.
+func disruptionEntrypoint() string {
+	if e := os.Getenv(envDisruptionEntrypoint); e != "" {
+		return e
+	}
+	return defaultDisruptionEntrypoint
 }
 
 // ShenDecider computes a disruption decision from a serialized snapshot. The
@@ -366,7 +379,7 @@ func newShencoreDisruptionDecider() (ShenDecider, error) {
 	if err != nil {
 		return nil, fmt.Errorf("loading shen disruption source %q: %w", src, err)
 	}
-	return &shencoreDisruptionDecider{engine: engine, entrypoint: shenDisruptionEntrypoint}, nil
+	return &shencoreDisruptionDecider{engine: engine, entrypoint: disruptionEntrypoint()}, nil
 }
 
 func (d *shencoreDisruptionDecider) Decide(_ context.Context, input sexpr.Value) (sexpr.Value, error) {
