@@ -67,6 +67,10 @@ type Controller struct {
 	mu            sync.Mutex
 	lastRun       map[string]time.Time
 	shenRecorder  *shenrecorder.Recorder
+	// shenDecider, when non-nil, overrides the process-singleton Shen decider used
+	// by shadow/shen decision engines. Tests inject a stub; production leaves it
+	// nil and lazily builds the shen-go-backed decider on first use.
+	shenDecider ShenDecider
 }
 
 // pollingPeriod that we inspect cluster to look for opportunities to disrupt
@@ -211,7 +215,7 @@ func (c *Controller) disrupt(ctx context.Context, disruption Method) (bool, erro
 		return false, fmt.Errorf("building disruption budgets, %w", err)
 	}
 	// Determine the disruption action
-	cmds, err := disruption.ComputeCommands(ctx, disruptionBudgetMapping, candidates...)
+	cmds, err := c.computeDisruptionCommands(ctx, disruption, disruptionBudgetMapping, candidates)
 	if err != nil {
 		return false, fmt.Errorf("computing disruption decision, %w", err)
 	}

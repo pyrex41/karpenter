@@ -40,7 +40,18 @@ func (c *Controller) recordDisrupt(ctx context.Context, method Method, candidate
 	if !c.shenRecorder.Enabled() {
 		return
 	}
-	candViews := lo.Map(candidates, func(cand *Candidate, _ int) schema.CandidateView {
+	input := schema.DisruptInputValue(c.clock.Now(), string(method.Reason()), candidateViews(candidates), budgets)
+	output := schema.DisruptResultValue(commandViews(method, cmds))
+	if err := c.shenRecorder.WriteRecord("disrupt", input, output); err != nil {
+		log.FromContext(ctx).Error(err, "recording shencore disrupt corpus")
+	}
+}
+
+// candidateViews projects disruption candidates into the schema's primitive view
+// form. Shared by the recorder and the shadow-mode comparison so both serialize a
+// pass's inputs identically.
+func candidateViews(candidates []*Candidate) []schema.CandidateView {
+	return lo.Map(candidates, func(cand *Candidate, _ int) schema.CandidateView {
 		return schema.CandidateView{
 			NodeName:       cand.Name(),
 			NodePool:       nodePoolName(cand),
@@ -55,7 +66,13 @@ func (c *Controller) recordDisrupt(ctx context.Context, method Method, candidate
 			}),
 		}
 	})
-	cmdViews := lo.Map(cmds, func(cmd Command, _ int) schema.CommandView {
+}
+
+// commandViews projects disruption commands into the schema's primitive view
+// form. Shared by the recorder and the shadow-mode comparison so the Go decision
+// serializes identically in both.
+func commandViews(method Method, cmds []Command) []schema.CommandView {
+	return lo.Map(cmds, func(cmd Command, _ int) schema.CommandView {
 		return schema.CommandView{
 			Decision:           string(cmd.Decision()),
 			Reason:             string(method.Reason()),
@@ -71,11 +88,6 @@ func (c *Controller) recordDisrupt(ctx context.Context, method Method, candidate
 			EstimatedSavings: cmd.EstimatedSavings(),
 		}
 	})
-	input := schema.DisruptInputValue(c.clock.Now(), string(method.Reason()), candViews, budgets)
-	output := schema.DisruptResultValue(cmdViews)
-	if err := c.shenRecorder.WriteRecord("disrupt", input, output); err != nil {
-		log.FromContext(ctx).Error(err, "recording shencore disrupt corpus")
-	}
 }
 
 // nodePoolName returns a candidate's NodePool name, tolerating a nil NodePool.

@@ -44,9 +44,25 @@ const (
 	MinValuesPolicyBestEffort MinValuesPolicy = "BestEffort"
 )
 
+// DecisionEngine selects which implementation computes a controller's scheduling
+// or disruption decisions. It is the seam for the Shen decision-core rewrite:
+//   - Go     — the existing imperative Go decision path (default).
+//   - Shadow — Go decides authoritatively, the Shen core also runs, and the two
+//     decisions are structurally diffed for observability. Shen errors never
+//     affect the Go decision.
+//   - Shen   — the Shen decision core decides authoritatively.
+type DecisionEngine string
+
+const (
+	DecisionEngineGo     DecisionEngine = "go"
+	DecisionEngineShadow DecisionEngine = "shadow"
+	DecisionEngineShen   DecisionEngine = "shen"
+)
+
 var (
 	validLogLevels          = []string{"", "debug", "info", "error"}
 	validPreferencePolicies = []PreferencePolicy{PreferencePolicyIgnore, PreferencePolicyRespect}
+	validDecisionEngines    = []DecisionEngine{DecisionEngineGo, DecisionEngineShadow, DecisionEngineShen}
 
 	Injectables = []Injectable{&Options{}}
 )
@@ -88,6 +104,8 @@ type Options struct {
 	PreferencePolicy                 PreferencePolicy
 	minValuesPolicyRaw               string
 	MinValuesPolicy                  MinValuesPolicy
+	disruptionDecisionEngineRaw      string
+	DisruptionDecisionEngine         DecisionEngine
 	IgnoreDRARequests                bool // NOTE: This flag will be removed once formal DRA support is GA in Karpenter.
 	FeatureGates                     FeatureGates
 }
@@ -130,6 +148,7 @@ func (o *Options) AddFlags(fs *FlagSet) {
 	fs.DurationVar(&o.BatchIdleDuration, "batch-idle-duration", env.WithDefaultDuration("BATCH_IDLE_DURATION", time.Second), "The maximum amount of time with no new pending pods that if exceeded ends the current batching window. If pods arrive faster than this time, the batching window will be extended up to the maxDuration. If they arrive slower, the pods will be batched separately.")
 	fs.StringVar(&o.preferencePolicyRaw, "preference-policy", env.WithDefaultString("PREFERENCE_POLICY", string(PreferencePolicyRespect)), "How the Karpenter scheduler should treat preferences. Preferences include preferredDuringSchedulingIgnoreDuringExecution node and pod affinities/anti-affinities and ScheduleAnyways topologySpreadConstraints. Can be one of 'Ignore' and 'Respect'")
 	fs.StringVar(&o.minValuesPolicyRaw, "min-values-policy", env.WithDefaultString("MIN_VALUES_POLICY", string(MinValuesPolicyStrict)), "Min values policy for scheduling. Options include 'Strict' for existing behavior where min values are strictly enforced or 'BestEffort' where Karpenter relaxes min values when it isn't satisfied.")
+	fs.StringVar(&o.disruptionDecisionEngineRaw, "disruption-decision-engine", env.WithDefaultString("DISRUPTION_DECISION_ENGINE", string(DecisionEngineGo)), "Which engine computes disruption decisions. 'go' uses the Go decision path (default); 'shadow' runs Go authoritatively while also running the Shen decision core and diffing the results; 'shen' lets the Shen decision core decide.")
 	fs.BoolVarWithEnv(&o.IgnoreDRARequests, "ignore-dra-requests", "IGNORE_DRA_REQUESTS", true, "When set, Karpenter will ignore pods' DRA requests during scheduling simulations. NOTE: This flag will be removed once formal DRA support is GA in Karpenter.")
 	fs.StringVar(&o.FeatureGates.inputStr, "feature-gates", env.WithDefaultString("FEATURE_GATES", "NodeRepair=false,ReservedCapacity=true,SpotToSpotConsolidation=false,NodeOverlay=false,StaticCapacity=false,CapacityBuffer=false"), "Optional features can be enabled / disabled using feature gates. Current options are: NodeRepair, ReservedCapacity, SpotToSpotConsolidation, NodeOverlay, StaticCapacity, and CapacityBuffer.")
 }
@@ -150,6 +169,9 @@ func (o *Options) Parse(fs *FlagSet, args ...string) error {
 	if !lo.Contains([]MinValuesPolicy{MinValuesPolicyStrict, MinValuesPolicyBestEffort}, MinValuesPolicy(o.minValuesPolicyRaw)) {
 		return fmt.Errorf("validating cli flags / env vars, invalid MIN_VALUES_POLICY %q", o.minValuesPolicyRaw)
 	}
+	if !lo.Contains(validDecisionEngines, DecisionEngine(o.disruptionDecisionEngineRaw)) {
+		return fmt.Errorf("validating cli flags / env vars, invalid DISRUPTION_DECISION_ENGINE %q", o.disruptionDecisionEngineRaw)
+	}
 	if o.CPURequests <= 0 {
 		o.CPURequests = 1000
 	}
@@ -160,6 +182,7 @@ func (o *Options) Parse(fs *FlagSet, args ...string) error {
 	o.FeatureGates = gates
 	o.PreferencePolicy = PreferencePolicy(o.preferencePolicyRaw)
 	o.MinValuesPolicy = MinValuesPolicy(o.minValuesPolicyRaw)
+	o.DisruptionDecisionEngine = DecisionEngine(o.disruptionDecisionEngineRaw)
 	return nil
 }
 
